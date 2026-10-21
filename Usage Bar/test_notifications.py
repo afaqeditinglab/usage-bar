@@ -21,7 +21,7 @@ def run():
                 assert calls[0][-1] != calls[1][-1]
                 assert not list(Path(folder).glob("ping-*.json"))
                 completed = bar.read_json(bar.status_path("Test"))["last_done_time"]
-                with patch.object(bar, "utc_now", return_value="2099-01-01T00:00:00+00:00"):
+                with patch.object(bar, "utc_now", return_value="2099-01-01T00:00:00+00:00"), patch.object(bar.time, "time", return_value=4070908800):
                     bar.report("Test", folder, 10, "working")
                 assert bar.read_json(bar.status_path("Test"))["last_done_time"] == completed
         with patch.object(audio, "ROOT", Path(folder)):

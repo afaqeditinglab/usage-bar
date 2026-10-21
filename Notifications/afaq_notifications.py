@@ -64,11 +64,33 @@ def wave_bytes(kind):
 
 
 def play(kind):
-    winsound.PlaySound(wave_bytes(kind), winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+    settings = ROOT / "sound-files.json"
+    if settings.is_file():
+        paths = json.loads(settings.read_text(encoding="utf-8"))
+        path = Path(paths[kind])
+        if not path.is_file():
+            raise OSError("Configured notification sound is unavailable")
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+    else:
+        winsound.PlaySound(wave_bytes(kind), winsound.SND_MEMORY | winsound.SND_NODEFAULT)
 
 
 def deliver_sound(event):
-    result = {"kind": event["kind"], "event_id": event.get("event_id"), "time": utc_now()}
+    import hashlib
+    event_id = event.get("event_id") or uuid.uuid4().hex
+    folder = ROOT / "events"
+    folder.mkdir(exist_ok=True)
+    receipt = folder / (hashlib.sha256(event_id.encode()).hexdigest() + ".json")
+    if receipt.is_file():
+        prior = json.loads(receipt.read_text(encoding="utf-8"))
+        if prior["kind"] != event["kind"]:
+            raise ValueError("A notification event cannot change its sound")
+        if prior["playback"] in ("completed", "playing"):
+            # A crash during playback is ambiguous: never replay it automatically.
+            return dict(prior, duplicate=True)
+    result = {"kind": event["kind"], "event_id": event_id, "time": utc_now(),
+              "playback": "playing"}
+    atomic_json(receipt, result)
     for attempt in range(3):
         try:
             play(event["kind"])
@@ -79,6 +101,7 @@ def deliver_sound(event):
             result.update(playback="failed", attempts=attempt + 1, error=str(error))
             if attempt < 2:
                 time.sleep(.2 * (attempt + 1))
+    atomic_json(receipt, result)
     atomic_json(ROOT / "last-notification.json", result)
     with (ROOT / "notification-history.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(result) + "\n")
@@ -101,7 +124,7 @@ def main():
         raise ctypes.WinError()
     acquired = False
     try:
-        acquired = kernel.WaitForSingleObject(mutex, 10000) in (0, 0x80)
+        acquired = kernel.WaitForSingleObject(mutex, 30000) in (0, 0x80)
         if not acquired:
             raise RuntimeError("Notification playback queue timed out")
         result = deliver_sound({"kind": args.kind, "event_id": args.event_id or uuid.uuid4().hex})

@@ -8,9 +8,11 @@ Use absolute paths and quote paths containing spaces. The paths below are placeh
 
 In a new continuation, a pasted `Continue chat:` title belongs to the previous conversation. Establish the new chat's own visible title before reporting; do not inherit the handoff's title or context percentage. Keep this new title stable when the user views other chats. Until its first completed reply, Cache is unknown; working/waiting reports do not start the timer.
 
-Use the local Usage Bar reporting tool with the actual current chat title. Start with a working report and keep its handoff metadata current. Do not guess or substitute another chat's title. You may run `usage_bar.py identify` while the app is foreground to read the visible header; remove app chrome/icons from the title, and retain a title already confirmed for the current task. If identification fails, save a project handoff and explain that matching data is unavailable.
+Use the local Usage Bar reporting tool with the actual current chat title. Start with a working report and keep its handoff metadata current. Do not guess or substitute another chat's title. You may run `usage_bar.py identify` while the app is foreground to read the visible header; remove app chrome/icons from the title, and retain a title already confirmed for the current task. If identification fails, try the thread-ID lookup below before declaring matching data unavailable.
 
 Use a best context estimate from 0 to 100 and clearly label it as estimated. Report waiting immediately before asking the user a question or deliberately requesting permission. Report done just before the final reply. Report working when resuming work. Working and waiting preserve the last completion timestamp.
+
+If header identification fails because the app is behind another window, use the app's thread-list tool when available. Match the current conversation's known thread ID to the exact returned title. Do not choose a title merely because it is most recent or foreground. Reporting works without foreground focus once the title is verified. If neither method establishes this chat's identity, save the project handoff and explain the missing report. Do not backdate a completion to fill Cache; the next genuine completed reply starts it.
 
 Example in PowerShell, with your own Python and package paths:
 

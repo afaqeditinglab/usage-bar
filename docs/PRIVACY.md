@@ -2,6 +2,8 @@
 
 ## Local features
 
+A local Windows hook detects Alt/Ctrl+Tab so the bar can hide before a switch. It does not record keys or block input. Foreground-window events are handled by a separate local thread. These hooks are removed when the bar exits.
+
 With the default configuration, Usage Bar makes no account requests and does not open your sign-in file. Context, handoffs and sounds work from local assistant reports. There is no product analytics or update checker.
 
 To match a chat, it captures the visible app header locally and runs Windows OCR through the included PowerShell helper. The temporary header image is deleted after the attempt; an abrupt process termination can leave a file in `Usage Bar/tmp`. Nothing uploads those images.
@@ -27,3 +29,5 @@ Network restrictions, expired tokens and unsupported plans may leave dashes. Do 
 ## Sharing a bug report
 
 Remove chat titles, project paths, account details and private text from logs and screenshots. Never attach `auth.json`, actual configuration, status reports, handoff files, usage caches or notification history. Share only the minimum diagnostic information needed to reproduce the issue.
+
+Optional original sound files can be selected with Notifications/sound-files.json, using waiting and done keys mapped to local WAV paths. Playback reads the originals directly. The helper keeps event receipts locally to prevent duplicate playback. It never replays history on startup. Muting, audio device failures and a crash during playback can prevent audible delivery; an interrupted event is not automatically replayed because its outcome is unknown.

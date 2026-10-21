@@ -50,6 +50,104 @@ u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                          ctypes.c_int, ctypes.c_int, wintypes.UINT]
 
+WIN_EVENT_PROC = ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD,
+                                  wintypes.HWND, wintypes.LONG, wintypes.LONG,
+                                  wintypes.DWORD, wintypes.DWORD)
+u.SetWinEventHook.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+                             WIN_EVENT_PROC, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+u.SetWinEventHook.restype = wintypes.HANDLE
+u.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+u.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+u.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+KEYBOARD_PROC = ctypes.WINFUNCTYPE(PTR, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+u.SetWindowsHookExW.argtypes = [ctypes.c_int, KEYBOARD_PROC, wintypes.HINSTANCE, wintypes.DWORD]
+u.SetWindowsHookExW.restype = wintypes.HANDLE
+u.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+u.CallNextHookEx.restype = PTR
+u.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+k.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+k.GetModuleHandleW.restype = wintypes.HMODULE
+
+
+class ForegroundVisibility:
+    def __init__(self, overlays):
+        self.overlays = overlays
+        self.switching = False
+        self.callback = WIN_EVENT_PROC(self.changed)
+        self.keyboard_callback = KEYBOARD_PROC(self.key_changed)
+        self.keyboard_hook = None
+        self.key_switching = False
+        self.hooks = []
+        self.thread = None
+        self.thread_id = None
+        self.ready = threading.Event()
+        self.error = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self.listen, daemon=True)
+        self.thread.start()
+        self.ready.wait()
+        if self.error:
+            raise self.error
+
+    def listen(self):
+        self.thread_id = k.GetCurrentThreadId()
+        try:
+            # An independent Windows message loop keeps hiding responsive during rendering.
+            for first, last in ((0x0003, 0x0003), (0x0014, 0x0015)):
+                hook = u.SetWinEventHook(first, last, None, self.callback, 0, 0, 0)
+                if not hook:
+                    raise OSError("Unable to monitor foreground changes; Usage Bar stays hidden")
+                self.hooks.append(hook)
+            self.keyboard_hook = u.SetWindowsHookExW(13, self.keyboard_callback, k.GetModuleHandleW(None), 0)
+            if not self.keyboard_hook:
+                raise OSError("Unable to monitor window-switch shortcuts; Usage Bar stays hidden")
+            self.ready.set()
+            message = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                u.TranslateMessage(ctypes.byref(message))
+                u.DispatchMessageW(ctypes.byref(message))
+        except Exception as error:
+            self.error = error
+        finally:
+            for hook in self.hooks:
+                u.UnhookWinEvent(hook)
+            self.hooks.clear()
+            if self.keyboard_hook:
+                u.UnhookWindowsHookEx(self.keyboard_hook)
+                self.keyboard_hook = None
+            self.ready.set()
+
+    def allows(self, hwnd):
+        return (not self.switching and not self.key_switching and self.error is None
+                and u.GetForegroundWindow() == hwnd and not u.IsIconic(hwnd))
+
+    def key_changed(self, code, message, address):
+        if code >= 0:
+            key = ctypes.cast(address, ctypes.POINTER(wintypes.DWORD))[0]
+            if key == 9 and message in (0x100, 0x104):
+                if (u.GetAsyncKeyState(0x12) | u.GetAsyncKeyState(0x11)) & 0x8000:
+                    # Hide before Windows receives Alt/Ctrl+Tab; never record or consume keys.
+                    self.key_switching = True
+                    self.changed(None, 0, None, 0, 0, 0, 0)
+            elif key in (9, 0x11, 0x12, 0xA2, 0xA3, 0xA4, 0xA5) and message in (0x101, 0x105):
+                self.key_switching = False
+        return u.CallNextHookEx(None, code, message, address)
+
+    def changed(self, hook, event, hwnd, object_id, child_id, thread_id, timestamp):
+        if event in (0x0014, 0x0015):
+            self.switching = event == 0x0014
+        # Read current focus, since queued events may describe an older window.
+        for owner, data in list(self.overlays.items()):
+            if not self.allows(owner):
+                u.ShowWindow(data["native"], 0)
+
+    def close(self):
+        if self.thread and self.thread.is_alive():
+            u.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)  # WM_QUIT
+            self.thread.join(timeout=2)
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -101,19 +199,36 @@ def status_path(name):
     return ROOT / ("status" + clean + ".json")
 
 
-def report(name, project, context, state, handoff_state=None, next_step=None, read_files=None):
+def report(name, project, context, state, handoff_state=None, next_step=None, read_files=None,
+           job_id=None, started_at=None, event_id=None):
     if not valid_percent(context):
         raise ValueError("Context estimate must be between 0 and 100")
     path = status_path(name)
     old = read_json(path, {})
     if old and os.path.normcase(old.get("project_folder", "")) != os.path.normcase(project):
         raise ValueError("This chat name already belongs to another project; use a unique name")
+    new_job = (not old.get("job_id") or (job_id and job_id != old.get("job_id"))
+               or (state == "working" and old.get("state") == "done" and not job_id))
+    received = started_at or (None if new_job else old.get("message_received_at")) or utc_now()
+    start = datetime.fromisoformat(received.replace("Z", "+00:00"))
+    if start.tzinfo is None or start.timestamp() > time.time() + 5:
+        raise ValueError("Job start must be a timezone-aware timestamp, not in the future")
+    if not event_id and not new_job and old.get("state") == state and state in ("waiting", "done"):
+        event_id = old.get("event_id")
     note = {"chat_name": name, "project_folder": project, "context_percent": context,
             "context_estimated": True, "time": utc_now(), "state": state,
-            "event_id": uuid.uuid4().hex}
+            "event_id": event_id or uuid.uuid4().hex,
+            "job_id": job_id or (uuid.uuid4().hex if new_job else old["job_id"]),
+            "message_received_at": received,
+            "timing_source": "provided_start" if started_at else (
+                "first_work_report" if new_job else old.get("timing_source")),
+            "job_finished_at": ((old.get("job_finished_at") if not new_job and old.get("state") == "done" else None)
+                                or utc_now()) if state == "done" else None}
+    if state == "done":
+        note["elapsed_seconds"] = max(0, int(datetime.fromisoformat(note["job_finished_at"]).timestamp() - start.timestamp()))
     last_done = old.get("last_done_time") or (old.get("time") if old.get("state") == "done" else None)
     if state == "done" or last_done:
-        note["last_done_time"] = note["time"] if state == "done" else last_done
+        note["last_done_time"] = note["job_finished_at"] if state == "done" else last_done
     for key, value in (("handoff_state", handoff_state), ("next_step", next_step),
                        ("read_files", read_files)):
         if value is not None or key in old:
@@ -123,12 +238,13 @@ def report(name, project, context, state, handoff_state=None, next_step=None, re
         try:
             result = subprocess.run([sys.executable, "-B", str(NOTIFICATIONS), state,
                                      "--event-id", note["event_id"]],
-                                    capture_output=True, timeout=15, creationflags=0x08000000)
+                                    capture_output=True, timeout=45, creationflags=0x08000000)
             if result.returncode:
                 raise RuntimeError("Notification process failed: " + result.stderr.decode(errors="replace")[-500:])
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             with (ROOT / "bar-errors.log").open("a", encoding="utf-8") as stream:
                 stream.write(utc_now() + " notification error: " + str(error) + "\n")
+            raise RuntimeError("Status saved, but notification delivery failed; check bar-errors.log") from error
     return path
 
 
@@ -350,6 +466,22 @@ FONT_DIR = ROOT / "fonts"
 _fonts = {}
 
 
+def job_duration(note, now=None):
+    try:
+        start = datetime.fromisoformat(note["message_received_at"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(note["job_finished_at"].replace("Z", "+00:00")) if note.get("job_finished_at") else None
+        if start.tzinfo is None or (end and end.tzinfo is None):
+            raise ValueError("Job timestamps need timezones")
+        elapsed = int((end.timestamp() if end else (time.time() if now is None else now)) - start.timestamp())
+        if elapsed < 0:
+            raise ValueError("Job timestamps are reversed")
+        minutes, seconds = divmod(elapsed, 60)
+        return ("Took " if end else "") + f"{minutes}m {seconds}s"
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError, OSError):
+        return "—"
+
+
+
 def cache_status(note, now=None):
     # Heuristic from published GPT-5.6+ API lifetime; app cache expiry is not exposed.
     stamp = (note or {}).get("last_done_time")
@@ -395,15 +527,17 @@ def pill_image(usage, note, button="Handoff", dark=True, background=None):
     context = note.get("context_percent") if note else None
     metrics = [("5h", usage.get("five_hour"), reset_label(usage.get("five_hour_reset"))),
                ("Week", usage.get("weekly"), reset_label(usage.get("weekly_reset"))),
-               ("Ctx", context, "New chat")]
+               ("Ctx", context, job_duration(note))]
     for index, (label, value, reset) in enumerate(metrics):
-        x, end = 16 + index*166, 160 + index*166
+        x, end = ((16, 148), (170, 302), (324, 492))[index]
         pct = (("~" if index == 2 else "") + f"{value:g}%") if valid_percent(value) else "—"
         reset = reset.removeprefix("Resets ").replace("Reset —", "—")
+        if index < 2 and not valid_percent(value) and usage.get("source") == "usage-unavailable":
+            reset = "Offline"
         # Explicit middle anchors avoid Helvetica's unusual ascender offsets.
         text(x, 18, label, 14, fg)
-        text(x+42, 18, pct, 16, fg, True)
-        text(end, 18, reset, 11, muted, anchor="rm")
+        text(x+42, 18, pct, 14 if index == 2 else 16, fg, True)
+        text(end, 18, reset, 9 if index == 2 else 11, muted, anchor="rm")
         draw.line((x*scale, 31*scale, end*scale, 31*scale),
                   fill="#555b62" if dark else "#ced6df", width=2*scale)
         if valid_percent(value) and value > 0:
@@ -427,7 +561,7 @@ def draw_pill(canvas, usage, note, button="Handoff", dark=True, background=None)
     from PIL import ImageTk
     cache_text, fraction, phase = cache_status(note)
     key = (json.dumps(usage, sort_keys=True), note.get("context_percent") if note else None,
-           cache_text, round(fraction or 0, 2), phase, button, dark, background)
+           cache_text, round(fraction or 0, 2), phase, job_duration(note), button, dark, background)
     if getattr(canvas, "pill_key", None) == key:
         return
     canvas.pill_key = key
@@ -546,6 +680,7 @@ def run_ui():
         canvas.pack()
         window.update_idletasks()
         native = u.GetAncestor(window.winfo_id(), 2)
+        u.SetWindowLongPtrW(native, -20, u.GetWindowLongPtrW(native, -20) | 0x08000000)
         data = {"window": window, "native": native, "canvas": canvas, "note": None, "copied_until": 0,
                 "header": None, "dark": None, "theme_color": None, "theme_checked": -100, "updated": -100, "pending": False,
                 "rect": None, "offset": 0, "drag": None}
@@ -614,8 +749,11 @@ def run_ui():
         foreground = u.GetForegroundWindow()
         if now - last_health >= 2:
             atomic_json(ROOT / "bar-state.json", {
-                "time": utc_now(), "pid": os.getpid(), "version": "integrated-4-cache",
+                "time": utc_now(), "pid": os.getpid(), "version": "integrated-5-foreground",
                 "codex_windows": len(windows),
+                "overlays": [{"native": d["native"], "client": d["window"].winfo_id(),
+                              "visible": bool(u.IsWindowVisible(d["native"])),
+                              "theme": d["theme_color"]} for d in overlays.values()],
                 "codex_foreground": foreground in windows,
                 "reason": "tracking-codex" if foreground in windows else "hidden-other-app-or-no-codex"})
             last_health = now
@@ -629,16 +767,14 @@ def run_ui():
             window = data["window"]
             left, top, right, bottom = rect
             available = right - left - 480
-            competing_window = (foreground not in (hwnd, data["native"])
-                                and u.IsWindowVisible(foreground))
-            if u.IsIconic(hwnd) or available < PILL_WIDTH or competing_window:
-                window.withdraw()
+            if not visibility.allows(hwnd) or available < PILL_WIDTH:
+                u.ShowWindow(data["native"], 0)
                 continue
             if foreground == hwnd and now - data["theme_checked"] >= .5:
                 stable_surface(data, sample_title_surface(hwnd, rect))
                 data["theme_checked"] = now
             if data["theme_color"] is None:
-                window.withdraw()
+                u.ShowWindow(data["native"], 0)
                 continue
             if (now - data["updated"] >= 30 or data["rect"] != rect) and not data["pending"]:
                 data["pending"] = True
@@ -663,17 +799,29 @@ def run_ui():
             over_button = x + BUTTON_LEFT <= pointer.x < x + width - 8 and y + 2 <= pointer.y < y + height - 2
             style = style & ~0x20 if alt or over_button else style | 0x20
             u.SetWindowLongPtrW(data["native"], -20, style)
-            # ShowWindow(SW_SHOWNOACTIVATE) preserves the user's current focus.
+            # Recheck after rendering: foreground may have changed during the tick.
+            if not visibility.allows(hwnd):
+                u.ShowWindow(data["native"], 0)
+                continue
             window.geometry(f"{width}x{height}{x:+d}{y:+d}")
-            window.deiconify()
+            window.state("normal")  # Unlike deiconify, do not explicitly raise/focus Tk's window.
             u.SetWindowPos(data["native"], wintypes.HWND(-1), x, y, width, height, 0x10 | 0x40)
+            if not visibility.allows(hwnd):
+                u.ShowWindow(data["native"], 0)
         root.after(100, tick)
 
-    tick()
-    root.mainloop()
-    k.CloseHandle.argtypes = [wintypes.HANDLE]
-    k.CloseHandle(mutex)
-    k.CloseHandle(legacy_mutex)
+    visibility = None
+    try:
+        visibility = ForegroundVisibility(overlays)
+        visibility.start()
+        tick()
+        root.mainloop()
+    finally:
+        if visibility:
+            visibility.close()
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle(mutex)
+        k.CloseHandle(legacy_mutex)
 
 
 def self_test():
@@ -803,6 +951,9 @@ def main():
     p.add_argument("--next-step")
     p.add_argument("--read-files", nargs="+")
     p.add_argument("--state", choices=["working", "done", "waiting"], default="done")
+    p.add_argument("--job-id")
+    p.add_argument("--started-at")
+    p.add_argument("--event-id")
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
@@ -812,7 +963,8 @@ def main():
         except PermissionError:
             raise SystemExit("Windows denied access to the startup setting. Run the Enable/Disable Auto Start file normally outside the managed chat.")
     elif args.command == "report":
-        print(report(args.chat, args.project, args.context, args.state, args.handoff_state, args.next_step, args.read_files))
+        print(report(args.chat, args.project, args.context, args.state, args.handoff_state, args.next_step,
+                     args.read_files, args.job_id, args.started_at, args.event_id))
     elif args.command == "test-sounds":
         print("Completion chime, then a three-second pause, then the short UI ping", flush=True)
         play("done")

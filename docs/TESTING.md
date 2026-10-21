@@ -13,7 +13,7 @@ Run `Usage Bar/Test Offline.cmd`. The release checks cover:
 - Startup enable/status/disable and another installation's startup ownership, using an in-memory registry.
 - Windows OCR against a generated sample image, including a path with spaces.
 
-Release preparation passed on Windows with Python 3.13.14 and Pillow 12.2.0. Check Setup.py and the full offline suite passed both in the prepared source tree and after clean ZIP extraction into a folder with spaces. CMD launcher resolution passed with an explicitly selected Python and with PATH fallback. The archive contains 30 allowlisted files; included SHA-256 checksums verified after extraction. No private configuration or runtime history is included.
+Release preparation passed on Windows with Python 3.13.14 and Pillow 12.2.0. Check Setup.py and the full offline suite passed both in the prepared source tree and after clean ZIP extraction into a folder with spaces. CMD launcher resolution passed with an explicitly selected Python and with PATH fallback. The archive contains 32 allowlisted files; included SHA-256 checksums verified after extraction. No private configuration or runtime history is included.
 
 ## Manual coverage and limits
 
@@ -24,3 +24,7 @@ A fresh Windows sign-in, startup after relocating the new package, actual app li
 No live account endpoint, DNS or credential test is performed by these checks. The account feature is opt-in and experimental. Sound tests verify generated waveforms and dispatch; physical speaker audibility and OS mute state cannot be asserted.
 
 This is a preview release. Report reproducible failures with sanitized details.
+
+21 October foreground regression: six offline tests cover focus changes, null/invisible focus, multiple owners, stale events, switcher suppression, shortcut pass-through and hook cleanup/failure. Live tests: 10 Alt+Tab switches each from Codex to Claude and Explorer, then 10 Ctrl+Tab presses. A 100-second native sampler recorded 25,881 samples, including 14,526 visible-bar samples, with zero final overlay-over-other-foreground violations. This is observed coverage, not a guarantee for every Windows scheduling condition.
+
+Job timing and sound receipts: repeated pending/completed reports reuse event IDs; completed sound events do not replay; failed playback retries and interrupted playback stays explicitly ambiguous. Four offline tests cover timer boundaries, job lifecycles, event receipts and direct file playback. Personal sound-files.json and original WAVs are excluded from the package.
